@@ -94,8 +94,8 @@ class TestUtils(unittest.TestCase):
         tasks.append(dict(name="hello", ec2="region=us-east1 etc=whatever"))
         tasks.append(dict(name="hello", action="ec2 region=us-east1 etc=whatever"))
         for task in tasks:
-            normalized_task = utils.normalize_task(task)
-            self.assertEqual(normalized_task, utils.normalize_task(normalized_task))
+            normalized_task = utils.normalize_task(task)[0]
+            self.assertEqual(normalized_task, utils.normalize_task(normalized_task)[0])
 
     def test_extract_from_list(self):
         block = dict(

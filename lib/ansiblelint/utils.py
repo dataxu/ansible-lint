@@ -26,6 +26,9 @@ import ansible.constants as C
 from ansible.errors import AnsibleError
 from ansible.module_utils.splitter import split_args
 
+from itertools import chain
+import re
+
 import yaml
 from yaml.composer import Composer
 from yaml.constructor import Constructor
@@ -89,7 +92,10 @@ def contains_quote(str1, list1):
         if item in str1:
             return item
 
-def tokenize(line):
+def tokenize(line, item=None):
+    line = line.lstrip()
+    if item:
+        line = re.sub(r'\{\{\s*item\s*\}\}', item, line)
     tokens = line.lstrip().split(" ")
     if tokens[0] == '-':
         tokens = tokens[1:]
@@ -263,27 +269,25 @@ def rolename(filepath):
     return role
 
 
-def _kv_to_dict(v):
-    (command, args, kwargs) = tokenize(v)
+def _kv_to_dict(v, item):
+    (command, args, kwargs) = tokenize(v, item)
     return (dict(module=command, module_arguments=args, **kwargs))
 
 
-def normalize_task(task):
-    '''Ensures tasks have an action key and strings are converted to python objects'''
-
+def normalize_single_task(task, item=None):
     result = dict()
     for (k, v) in task.items():
         if k in VALID_KEYS or k.startswith('with_'):
             if k == 'local_action' or k == 'action':
                 if not isinstance(v, dict):
-                    v = _kv_to_dict(v)
+                    v = _kv_to_dict(v, item)
                 v['module_arguments'] = v.get('module_arguments', list())
                 result['action'] = v
             else:
                 result[k] = v
         else:
             if isinstance(v, basestring):
-                v = _kv_to_dict(k + ' ' + v)
+                v = _kv_to_dict(k + ' ' + v, item)
             elif not v:
                 v = dict(module=k)
             else:
@@ -300,6 +304,21 @@ def normalize_task(task):
                         raise RuntimeError("Was not expecting value %s of type %s for key %s\nTask: %s" % (str(v), type(v), k), str(task))  # noqa
             v['module_arguments'] = v.get('module_arguments', list())
             result['action'] = v
+    return result
+
+
+def normalize_task(task):
+    '''Ensures tasks have an action key and strings are converted to python objects'''
+    result = []
+    if 'with_items' in task and isinstance(task['with_items'], list):
+        items = task['with_items']
+        for item in items:
+            if isinstance(item, basestring):
+                norm_task = normalize_single_task(task, item)
+                result.append(norm_task)
+    else:
+        norm_task = normalize_single_task(task, None)
+        result.append(norm_task)
     return result
 
 
@@ -339,8 +358,9 @@ def get_action_tasks(yaml, file):
     # Remove block/rescue/always elements from tasks list
     tasks[:] = [task for task in tasks if all(k not in task for k in ('block', 'rescue', 'always'))]
 
-    return [normalize_task(task) for task in tasks
-            if 'include' not in task.keys()]
+    norm_tasks = [normalize_task(task) for task in tasks
+                  if 'include' not in task.keys()]
+    return list(chain.from_iterable(norm_tasks))
 
 
 def parse_yaml_linenumbers(data):
