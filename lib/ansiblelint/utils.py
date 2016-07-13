@@ -25,6 +25,10 @@ import os
 import ansible.constants as C
 from ansible.errors import AnsibleError
 from ansible.module_utils.splitter import split_args
+
+from itertools import chain
+import re
+
 import yaml
 from yaml.composer import Composer
 from yaml.constructor import Constructor
@@ -106,7 +110,10 @@ def contains_quote(str1, list1):
         if item in str1:
             return item
 
-def tokenize(line):
+def tokenize(line, item=None):
+    line = line.lstrip()
+    if item:
+        line = re.sub(r'\{\{\s*item\s*\}\}', item, line)
     tokens = line.lstrip().split(" ")
     if tokens[0] == '-':
         tokens = tokens[1:]
@@ -116,7 +123,8 @@ def tokenize(line):
 
     args = list()
     kwargs = dict()
- 
+    nonkvfound = False
+
     start_quotes = ['\'', '\"', '{{', '{%', '{#']
     end_quotes   = ['\'', '\"', '}}', '%}', '#}']
     quote = None
@@ -132,10 +140,11 @@ def tokenize(line):
             item = contains_quote(arg, start_quotes)
             quote = end_quotes[start_quotes.index(item)]
         if quote is None:
-            if "=" in arg:
+            if "=" in arg and not nonkvfound:
                 kv = arg.split("=", 1)
                 kwargs[kv[0]] = kv[1]
             else:
+                nonkvfound = True
                 args.append(arg)
     return (command, args, kwargs)
 
@@ -307,7 +316,6 @@ def rolename(filepath):
     role = role[:role.find('/')]
     return role
 
-
 def _kv_to_dict(v):
     (command, args, kwargs) = tokenize(v)
     return (dict(__ansible_module__=command, __ansible_arguments__=args, **kwargs))
@@ -315,7 +323,6 @@ def _kv_to_dict(v):
 
 def normalize_task_v2(task):
     '''Ensures tasks have an action key and strings are converted to python objects'''
-
     result = dict()
     mod_arg_parser = ModuleArgsParser(task)
     try:

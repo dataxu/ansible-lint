@@ -49,10 +49,7 @@ class TestUtils(unittest.TestCase):
     def test_tokenize_more_than_one_arg(self):
         (cmd, args, kwargs) = utils.tokenize("action: whatever bobbins x=y z=x c=3")
         self.assertEqual(cmd, "whatever")
-        self.assertEqual(args[0], "bobbins")
-        self.assertEqual(args[1], "x=y")
-        self.assertEqual(args[2], "z=x")
-        self.assertEqual(args[3], "c=3")
+        self.assertEqual(args, ['bobbins', "x=y", "z=x", "c=3"])
 
     def test_tokenize_command_with_args(self):
         cmd, args, kwargs = utils.tokenize("action: command chdir=wxy creates=zyx tar xzf zyx.tgz")
@@ -96,6 +93,25 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task2, 'tasks.yml'))
         self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task3, 'tasks.yml'))
         self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task4, 'tasks.yml'))
+
+    def test_normalize_task_is_idempotent(self):
+        tasks = list()
+        tasks.append(dict(name="hello", action={'module': 'ec2',
+                                                'region': 'us-east1',
+                                                'etc': 'whatever'}))
+        tasks.append(dict(name="hello", ec2={'region': 'us-east1', 'etc': 'whatever'}))
+        tasks.append(dict(name="hello", ec2="region=us-east1 etc=whatever"))
+        tasks.append(dict(name="hello", action="ec2 region=us-east1 etc=whatever"))
+        for task in tasks:
+            normalized_task = utils.normalize_task(task, 'tasks.yml')
+            normalized_task['action']['module'] = normalized_task['action']['__ansible_module__']
+            del normalized_task['action']['__ansible_module__']
+
+            renormalized_task = utils.normalize_task(dict(normalized_task), 'tasks.yml')
+            renormalized_task['action']['module'] = renormalized_task['action']['__ansible_module__']
+            del renormalized_task['action']['__ansible_module__']
+
+            self.assertEqual(normalized_task, renormalized_task)
 
     def test_extract_from_list(self):
         block = dict(
