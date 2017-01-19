@@ -1,5 +1,4 @@
-# Copyright (c) 2013-2014 Will Thames <will@thames.id.au>
-#               2014      Akira Yoshiyama <akirayoshiyama@gmail.com>
+# Copyright (c) 2016 Will Thames <will@thames.id.au>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -19,21 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import os
-import unittest
-
-import ansiblelint
-from ansiblelint import RulesCollection
+from ansiblelint import AnsibleLintRule
+from ansiblelint.utils import LINE_NUMBER_KEY, FILENAME_KEY
 
 
-class TestRule(unittest.TestCase):
+class EnvVarsInCommandRule(AnsibleLintRule):
+    id = 'ANSIBLE0014'
+    shortdesc = "Environment variables don't work as part of command"
+    description = 'Environment variables should be passed to shell or ' \
+                  'command through environment argument'
+    tags = ['bug']
 
-    def setUp(self):
-        rulesdir = os.path.join('lib', 'ansiblelint', 'rules')
-        self.rules = RulesCollection.create_from_directory(rulesdir)
+    expected_args = ['chdir', 'creates', 'executable', 'removes', 'warn',
+                     '__ansible_module__', '__ansible_arguments__',
+                     LINE_NUMBER_KEY, FILENAME_KEY]
 
-    def test_runner_count(self):
-        filename = 'test/skiptasks.yml'
-        tags = ['ANSIBLE0004', 'ANSIBLE0005', 'ANSIBLE0006', 'ANSIBLE0007']
-        runner = ansiblelint.Runner(self.rules, filename, tags, [], [])
-        self.assertEqual(len(runner.run()), 6)
+    def matchtask(self, file, task):
+        if task["action"]["__ansible_module__"] in ['shell', 'command']:
+            return any([arg not in self.expected_args for arg in task['action']] +
+                       ["=" in task['action']['__ansible_arguments__'][0]])

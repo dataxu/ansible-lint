@@ -38,11 +38,13 @@ class CommandsInsteadOfModulesRule(AnsibleLintRule):
     _modules = {'git': 'git', 'hg': 'hg', 'curl': 'get_url or uri', 'wget': 'get_url or uri',
                 'svn': 'subversion', 'service': 'service', 'mount': 'mount',
                 'rpm': 'yum or rpm_key', 'yum': 'yum', 'apt-get': 'apt-get',
-                'unzip': 'unarchive', 'tar': 'unarchive', 'chkconfig': 'service'}
+                'unzip': 'unarchive', 'tar': 'unarchive', 'chkconfig': 'service',
+                'rsync': 'synchronize'}
 
     def matchtask(self, file, task):
-        if task["action"]["module"] in self._commands and task["action"]["module_arguments"]:
-            executable = os.path.basename(task["action"]["module_arguments"][0])
+        if task["action"]["__ansible_module__"] in self._commands and \
+                task["action"]["__ansible_arguments__"]:
+            executable = os.path.basename(task["action"]["__ansible_arguments__"][0])
             if executable in self._modules and \
                     boolean(task['action'].get('warn', True)):
                 message = "{0} used in place of {1} module"

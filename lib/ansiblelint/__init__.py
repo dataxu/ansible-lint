@@ -26,6 +26,8 @@ import sys
 import ansiblelint.utils
 import codecs
 
+default_rulesdir = os.path.join(os.path.dirname(ansiblelint.utils.__file__), 'rules')
+
 
 class AnsibleLintRule(object):
 
@@ -35,11 +37,14 @@ class AnsibleLintRule(object):
     def verbose(self):
         return self.id + ": " + self.shortdesc + "\n  " + self.description
 
-    def match(self, file="", line=""):
-        return []
+    match = None
+    matchtask = None
+    matchplay = None
 
     def matchlines(self, file, text):
         matches = []
+        if not self.match:
+            return matches
         # arrays are 0-based, line numbers are 1-based
         # so use prev_line_no as the counter
         for (prev_line_no, line) in enumerate(text.split("\n")):
@@ -52,14 +57,13 @@ class AnsibleLintRule(object):
                                file['path'], self, message))
         return matches
 
-    def matchtask(self, file="", task=None):
-        return []
-
     def matchtasks(self, file, text):
         matches = []
-        yaml = ansiblelint.utils.parse_yaml_linenumbers(text)
+        if not self.matchtask:
+            return matches
+        yaml = ansiblelint.utils.parse_yaml_linenumbers(text, file['path'])
         if yaml:
-            for task in ansiblelint.utils.get_action_tasks(yaml, file):
+            for task in ansiblelint.utils.get_normalized_tasks(yaml, file):
                 # An empty `tags` block causes `None` to be returned if
                 # the `or []` is not present - `task.get('tags', [])`
                 # does not suffice.
@@ -78,7 +82,9 @@ class AnsibleLintRule(object):
 
     def matchyaml(self, file, text):
         matches = []
-        yaml = ansiblelint.utils.parse_yaml_linenumbers(text)
+        if not self.matchplay:
+            return matches
+        yaml = ansiblelint.utils.parse_yaml_linenumbers(text, file['path'])
         if yaml and hasattr(self, 'matchplay'):
             for play in yaml:
                 result = self.matchplay(file, play)
@@ -174,16 +180,17 @@ class Match(object):
 
 class Runner(object):
 
-    def __init__(self, rules, playbooks, tags, skip_list, exclude_paths,
+    def __init__(self, rules, playbook, tags, skip_list, exclude_paths,
                  verbosity=0):
         self.rules = rules
         self.playbooks = set()
-        for pb in playbooks:
-            # assume role if directory
-            if os.path.isdir(pb):
-                self.playbooks.add((pb, 'role'))
-            else:
-                self.playbooks.add((pb, 'playbook'))
+        # assume role if directory
+        if os.path.isdir(playbook):
+            self.playbooks.add((playbook, 'role'))
+            self.playbook_dir = playbook
+        else:
+            self.playbooks.add((playbook, 'playbook'))
+            self.playbook_dir = os.path.dirname(playbook)
         self.tags = tags
         self.skip_list = skip_list
         self._update_exclude_paths(exclude_paths)
@@ -217,7 +224,7 @@ class Runner(object):
         visited = set()
         while (visited != self.playbooks):
             for arg in self.playbooks - visited:
-                for child in ansiblelint.utils.find_children(arg):
+                for child in ansiblelint.utils.find_children(arg, self.playbook_dir):
                     if self.is_excluded(child['path']):
                         continue
                     self.playbooks.add((child['path'], child['type']))

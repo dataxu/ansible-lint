@@ -25,6 +25,10 @@ import os
 import ansible.constants as C
 from ansible.errors import AnsibleError
 from ansible.module_utils.splitter import split_args
+
+from itertools import chain
+import re
+
 import yaml
 from yaml.composer import Composer
 from yaml.constructor import Constructor
@@ -41,6 +45,7 @@ except ImportError:
     from ansible.template import Templar
     from ansible.parsing.mod_args import ModuleArgsParser
     from ansible.plugins import module_loader
+    from ansible.errors import AnsibleParserError
     ANSIBLE_VERSION = 2
 
     def parse_yaml_from_file(filepath):
@@ -59,6 +64,7 @@ except ImportError:
         return templar.template(varname, **kwargs)
 
 LINE_NUMBER_KEY = '__line__'
+FILENAME_KEY = '__file__'
 
 VALID_KEYS = [
     'name', 'action', 'when', 'async', 'poll', 'notify',
@@ -69,6 +75,16 @@ VALID_KEYS = [
     'su', 'su_user', 'su_pass', 'no_log', 'run_once',
     'become', 'become_user', 'become_method',
 ]
+
+BLOCK_NAME_TO_ACTION_TYPE_MAP = {
+    'tasks': 'task',
+    'handlers': 'handler',
+    'pre_tasks': 'task',
+    'post_tasks': 'task',
+    'block': 'meta',
+    'rescue': 'meta',
+    'always': 'meta',
+}
 
 
 def load_plugins(directory):
@@ -89,7 +105,15 @@ def load_plugins(directory):
     return result
 
 
-def tokenize(line):
+def contains_quote(str1, list1):
+    for item in list1:
+        if item in str1:
+            return item
+
+def tokenize(line, item=None):
+    line = line.lstrip()
+    if item:
+        line = re.sub(r'\{\{\s*item\s*\}\}', item, line)
     tokens = line.lstrip().split(" ")
     if tokens[0] == '-':
         tokens = tokens[1:]
@@ -99,12 +123,29 @@ def tokenize(line):
 
     args = list()
     kwargs = dict()
+    nonkvfound = False
+
+    start_quotes = ['\'', '\"', '{{', '{%', '{#']
+    end_quotes   = ['\'', '\"', '}}', '%}', '#}']
+    quote = None
+    tmp = ''
     for arg in tokens[1:]:
-        if "=" in arg:
-            kv = arg.split("=", 1)
-            kwargs[kv[0]] = kv[1]
-        else:
-            args.append(arg)
+        if quote is not None:
+            tmp = tmp + ' ' + arg
+            if len(arg) > 0 and quote in arg:
+                 quote = None
+                 arg = tmp
+        elif len(arg) > 0 and contains_quote(arg, start_quotes) is not None:
+            tmp = arg
+            item = contains_quote(arg, start_quotes)
+            quote = end_quotes[start_quotes.index(item)]
+        if quote is None:
+            if "=" in arg and not nonkvfound:
+                kv = arg.split("=", 1)
+                kwargs[kv[0]] = kv[1]
+            else:
+                nonkvfound = True
+                args.append(arg)
     return (command, args, kwargs)
 
 
@@ -117,7 +158,7 @@ def _playbook_items(pb_data):
         return [item for play in pb_data for item in play.items()]
 
 
-def find_children(playbook):
+def find_children(playbook, playbook_dir):
     if not os.path.exists(playbook[0]):
         return []
     if playbook[1] == 'role':
@@ -131,7 +172,7 @@ def find_children(playbook):
     basedir = os.path.dirname(playbook[0])
     items = _playbook_items(playbook_ds)
     for item in items:
-        for child in play_children(basedir, item, playbook[1]):
+        for child in play_children(basedir, item, playbook[1], playbook_dir):
             if "$" in child['path'] or "{{" in child['path']:
                 continue
             valid_tokens = list()
@@ -159,7 +200,7 @@ def template(basedir, value, vars, fail_on_undefined=False, **kwargs):
     return value
 
 
-def play_children(basedir, item, parent_type):
+def play_children(basedir, item, parent_type, playbook_dir):
     delegate_map = {
         'tasks': _taskshandlers_children,
         'pre_tasks': _taskshandlers_children,
@@ -170,13 +211,15 @@ def play_children(basedir, item, parent_type):
         'handlers': _taskshandlers_children,
     }
     (k, v) = item
+    play_library = os.path.join(os.path.abspath(basedir), 'library')
+    _load_library_if_exists(play_library)
+
     if k in delegate_map:
         if v:
-            v = template(
-                    os.path.abspath(basedir),
-                    v,
-                    dict(playbook_dir=os.path.abspath(basedir)),
-                    fail_on_undefined=False)
+            v = template(os.path.abspath(basedir),
+                         v,
+                         dict(playbook_dir=os.path.abspath(basedir)),
+                         fail_on_undefined=False)
             return delegate_map[k](basedir, k, v, parent_type)
     return []
 
@@ -211,6 +254,11 @@ def _roles_children(basedir, k, v, parent_type):
     return results
 
 
+def _load_library_if_exists(path):
+    if os.path.exists(path):
+        module_loader.add_directory(path)
+
+
 def _rolepath(basedir, role):
     role_path = None
 
@@ -239,9 +287,7 @@ def _rolepath(basedir, role):
             break
 
     if role_path:
-        role_modules = os.path.join(role_path, 'library')
-        if os.path.exists(role_modules):
-            module_loader.add_directory(role_modules)
+        _load_library_if_exists(os.path.join(role_path, 'library'))
 
     return role_path
 
@@ -270,23 +316,36 @@ def rolename(filepath):
     role = role[:role.find('/')]
     return role
 
-
 def _kv_to_dict(v):
     (command, args, kwargs) = tokenize(v)
-    return (dict(module=command, module_arguments=args, **kwargs))
+    return (dict(__ansible_module__=command, __ansible_arguments__=args, **kwargs))
 
 
 def normalize_task_v2(task):
     '''Ensures tasks have an action key and strings are converted to python objects'''
-
     result = dict()
     mod_arg_parser = ModuleArgsParser(task)
-    action, arguments, result['delegate_to'] = mod_arg_parser.parse()
+    try:
+        action, arguments, result['delegate_to'] = mod_arg_parser.parse()
+    except AnsibleParserError as e:
+        try:
+            task_info = "%s:%s" % (task[FILENAME_KEY], task[LINE_NUMBER_KEY])
+            del task[FILENAME_KEY]
+            del task[LINE_NUMBER_KEY]
+        except KeyError:
+            task_info = "Unknown"
+        try:
+            import pprint
+            pp = pprint.PrettyPrinter(indent=2)
+            task_pprint = pp.pformat(task)
+        except ImportError:
+            task_pprint = task
+        raise SystemExit("Couldn't parse task at %s (%s)\n%s" % (task_info, e.message, task_pprint))
 
     # denormalize shell -> command conversion
-    if '_use_shell' in arguments:
+    if '_uses_shell' in arguments:
         action = 'shell'
-        del(arguments['_use_shell'])
+        del(arguments['_uses_shell'])
 
     for (k, v) in list(task.items()):
         if k in ('action', 'local_action', 'args', 'delegate_to') or k == action:
@@ -296,13 +355,13 @@ def normalize_task_v2(task):
         else:
             result[k] = v
 
-    result['action'] = dict(module=action)
+    result['action'] = dict(__ansible_module__=action)
 
     if '_raw_params' in arguments:
-        result['action']['module_arguments'] = arguments['_raw_params'].split()
+        result['action']['__ansible_arguments__'] = arguments['_raw_params'].split()
         del(arguments['_raw_params'])
     else:
-        result['action']['module_arguments'] = list()
+        result['action']['__ansible_arguments__'] = list()
     result['action'].update(arguments)
     return result
 
@@ -314,7 +373,7 @@ def normalize_task_v1(task):
             if k == 'local_action' or k == 'action':
                 if not isinstance(v, dict):
                     v = _kv_to_dict(v)
-                v['module_arguments'] = v.get('module_arguments', list())
+                v['__ansible_arguments__'] = v.get('__ansible_arguments__', list())
                 result['action'] = v
             else:
                 result[k] = v
@@ -322,10 +381,10 @@ def normalize_task_v1(task):
             if isinstance(v, basestring):
                 v = _kv_to_dict(k + ' ' + v)
             elif not v:
-                v = dict(module=k)
+                v = dict(__ansible_module__=k)
             else:
                 if isinstance(v, dict):
-                    v.update(dict(module=k))
+                    v.update(dict(__ansible_module__=k))
                 else:
                     if k == '__line__':
                         # Keep the line number stored
@@ -340,19 +399,32 @@ def normalize_task_v1(task):
                                            "Task: %s. Check the syntax of your playbook using "
                                            "ansible-playbook --syntax-check" %
                                            (str(v), type(v), k, str(task)))
-            v['module_arguments'] = v.get('module_arguments', list())
+            v['__ansible_arguments__'] = v.get('__ansible_arguments__', list())
             result['action'] = v
+    if 'module' in result['action']:
+        # this happens when a task uses
+        # local_action:
+        #   module: ec2
+        #   etc...
+        result['action']['__ansible_module__'] = result['action']['module']
+        del(result['action']['module'])
     if 'args' in result:
         result['action'].update(result.get('args'))
         del(result['args'])
     return result
 
 
-def normalize_task(task):
+def normalize_task(task, filename):
+    ansible_action_type = task.get('__ansible_action_type__', 'task')
+    if '__ansible_action_type__' in task:
+        del(task['__ansible_action_type__'])
     if ANSIBLE_VERSION < 2:
-        return normalize_task_v1(task)
+        task = normalize_task_v1(task)
     else:
-        return normalize_task_v2(task)
+        task = normalize_task_v2(task)
+    task[FILENAME_KEY] = filename
+    task['__ansible_action_type__'] = ansible_action_type
+    return task
 
 
 def task_to_str(task):
@@ -361,9 +433,9 @@ def task_to_str(task):
         return name
     action = task.get("action")
     args = " " .join(["{0}={1}".format(k, v) for (k, v) in action.items()
-                     if k not in ["module", "module_arguments"]] +
-                     action.get("module_arguments"))
-    return "{0} {1}".format(action["module"], args)
+                     if k not in ["__ansible_module__", "__ansible_arguments__"]] +
+                     action.get("__ansible_arguments__"))
+    return "{0} {1}".format(action["__ansible_module__"], args)
 
 
 def extract_from_list(blocks, candidates):
@@ -372,7 +444,7 @@ def extract_from_list(blocks, candidates):
         for candidate in candidates:
             if candidate in block:
                 if isinstance(block[candidate], list):
-                    results.extend(block[candidate])
+                    results.extend(add_action_type(block[candidate], candidate))
                 elif block[candidate] is not None:
                     raise RuntimeError(
                         "Key '%s' defined, but bad value: '%s'" %
@@ -380,10 +452,18 @@ def extract_from_list(blocks, candidates):
     return results
 
 
+def add_action_type(actions, action_type):
+    results = list()
+    for action in actions:
+        action['__ansible_action_type__'] = BLOCK_NAME_TO_ACTION_TYPE_MAP[action_type]
+        results.append(action)
+    return results
+
+
 def get_action_tasks(yaml, file):
     tasks = list()
     if file['type'] in ['tasks', 'handlers']:
-        tasks = yaml
+        tasks = add_action_type(yaml, file['type'])
     else:
         tasks.extend(extract_from_list(yaml, ['tasks', 'handlers', 'pre_tasks', 'post_tasks']))
 
@@ -393,16 +473,19 @@ def get_action_tasks(yaml, file):
     block_rescue_always = ('block', 'rescue', 'always')
     tasks[:] = [task for task in tasks if all(k not in task for k in block_rescue_always)]
 
-    return [normalize_task(task) for task in tasks
-            if 'include' not in task.keys()]
+    return [task for task in tasks if 'include' not in task.keys()]
 
 
-def parse_yaml_linenumbers(data):
+def get_normalized_tasks(yaml, file):
+    tasks = get_action_tasks(yaml, file)
+    return [normalize_task(task, file['path']) for task in tasks]
+
+
+def parse_yaml_linenumbers(data, filename):
     """Parses yaml as ansible.utils.parse_yaml but with linenumbers.
 
     The line numbers are stored in each node's LINE_NUMBER_KEY key.
     """
-    loader = yaml.Loader(data)
 
     def compose_node(parent, index):
         # the line number where the previous token has ended (plus empty lines)
@@ -416,7 +499,11 @@ def parse_yaml_linenumbers(data):
         mapping[LINE_NUMBER_KEY] = node.__line__
         return mapping
 
-    loader.compose_node = compose_node
-    loader.construct_mapping = construct_mapping
-    data = loader.get_single_data()
+    try:
+        loader = yaml.Loader(data)
+        loader.compose_node = compose_node
+        loader.construct_mapping = construct_mapping
+        data = loader.get_single_data()
+    except (yaml.parser.ParserError, yaml.scanner.ScannerError) as e:
+        raise SystemExit("Failed to parse YAML in %s: %s" % (filename, str(e)))
     return data

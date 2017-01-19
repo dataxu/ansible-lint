@@ -49,8 +49,7 @@ class TestUtils(unittest.TestCase):
     def test_tokenize_more_than_one_arg(self):
         (cmd, args, kwargs) = utils.tokenize("action: whatever bobbins x=y z=x c=3")
         self.assertEqual(cmd, "whatever")
-        self.assertEqual(args[0], "bobbins")
-        self.assertEqual(kwargs, {'x': 'y', 'z': 'x', 'c': '3'})
+        self.assertEqual(args, ['bobbins', "x=y", "z=x", "c=3"])
 
     def test_tokenize_command_with_args(self):
         cmd, args, kwargs = utils.tokenize("action: command chdir=wxy creates=zyx tar xzf zyx.tgz")
@@ -60,10 +59,18 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(args[2], "zyx.tgz")
         self.assertEqual(kwargs, {'chdir': 'wxy', 'creates': 'zyx'})
 
+    def test_tokenize_command_with_nested_jinja(self):
+        (cmd, args, kwargs) = utils.tokenize("action: command tar xzf '{{ item }}'")
+        self.assertEquals(cmd, "command")
+        self.assertEquals(args[0], "tar")
+        self.assertEquals(args[1], "xzf")
+        self.assertEquals(args[2], "'{{ item }}'")
+        self.assertEquals(kwargs, { })
+
     def test_normalize_simple_command(self):
         task1 = dict(name="hello", action="command chdir=abc echo hello world")
         task2 = dict(name="hello", command="chdir=abc echo hello world")
-        self.assertEqual(utils.normalize_task(task1), utils.normalize_task(task2))
+        self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task2, 'tasks.yml'))
 
     def test_normalize_complex_command(self):
         task1 = dict(name="hello", action={'module': 'ec2',
@@ -73,9 +80,19 @@ class TestUtils(unittest.TestCase):
                                         'etc': 'whatever'})
         task3 = dict(name="hello", ec2="region=us-east1 etc=whatever")
         task4 = dict(name="hello", action="ec2 region=us-east1 etc=whatever")
-        self.assertEqual(utils.normalize_task(task1), utils.normalize_task(task2))
-        self.assertEqual(utils.normalize_task(task2), utils.normalize_task(task3))
-        self.assertEqual(utils.normalize_task(task3), utils.normalize_task(task4))
+        self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task2, 'tasks.yml'))
+        self.assertEqual(utils.normalize_task(task2, 'tasks.yml'), utils.normalize_task(task3, 'tasks.yml'))
+        self.assertEqual(utils.normalize_task(task3, 'tasks.yml'), utils.normalize_task(task4, 'tasks.yml'))
+
+    def test_normalize_args(self):
+        task1 = dict(git={'version': 'abc'}, args={'repo': 'blah', 'dest': 'xyz'})
+        task2 = dict(git={'version': 'abc', 'repo': 'blah', 'dest': 'xyz'})
+
+        task3 = dict(git='version=abc repo=blah dest=xyz')
+        task4 = dict(git=None, args={'repo': 'blah', 'dest': 'xyz', 'version': 'abc'})
+        self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task2, 'tasks.yml'))
+        self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task3, 'tasks.yml'))
+        self.assertEqual(utils.normalize_task(task1, 'tasks.yml'), utils.normalize_task(task4, 'tasks.yml'))
 
     def test_normalize_task_is_idempotent(self):
         tasks = list()
@@ -86,31 +103,28 @@ class TestUtils(unittest.TestCase):
         tasks.append(dict(name="hello", ec2="region=us-east1 etc=whatever"))
         tasks.append(dict(name="hello", action="ec2 region=us-east1 etc=whatever"))
         for task in tasks:
-            normalized_task = utils.normalize_task(task)
-            self.assertEqual(normalized_task, utils.normalize_task(normalized_task))
+            normalized_task = utils.normalize_task(task, 'tasks.yml')
+            normalized_task['action']['module'] = normalized_task['action']['__ansible_module__']
+            del normalized_task['action']['__ansible_module__']
 
-    def test_normalize_args(self):
-        task1 = dict(git={'version': 'abc'}, args={'repo': 'blah', 'dest': 'xyz'})
-        task2 = dict(git={'version': 'abc', 'repo': 'blah', 'dest': 'xyz'})
+            renormalized_task = utils.normalize_task(dict(normalized_task), 'tasks.yml')
+            renormalized_task['action']['module'] = renormalized_task['action']['__ansible_module__']
+            del renormalized_task['action']['__ansible_module__']
 
-        task3 = dict(git='version=abc repo=blah dest=xyz')
-        task4 = dict(git=None, args={'repo': 'blah', 'dest': 'xyz', 'version': 'abc'})
-        self.assertEqual(utils.normalize_task(task1), utils.normalize_task(task2))
-        self.assertEqual(utils.normalize_task(task1), utils.normalize_task(task3))
-        self.assertEqual(utils.normalize_task(task1), utils.normalize_task(task4))
+            self.assertEqual(normalized_task, renormalized_task)
 
     def test_extract_from_list(self):
         block = dict(
-            test_list = ['foo', 'bar'],
-            test_none = None,
-            test_string = 'foo'
+                block = [dict(tasks=[dict(name="hello",command="whoami")])],
+                test_none = None,
+                test_string = 'foo'
         )
         blocks = [block]
 
-        test_list = utils.extract_from_list(blocks, ['test_list'])
+        test_list = utils.extract_from_list(blocks, ['block'])
         test_none = utils.extract_from_list(blocks, ['test_none'])
 
-        self.assertEqual(list(block['test_list']), test_list)
+        self.assertEqual(list(block['block']), test_list)
         self.assertEqual(list(), test_none)
         with self.assertRaises(RuntimeError):
             utils.extract_from_list(blocks, ['test_string'])
