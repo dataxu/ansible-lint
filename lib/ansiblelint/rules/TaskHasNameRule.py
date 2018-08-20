@@ -28,5 +28,9 @@ class TaskHasNameRule(AnsibleLintRule):
                   'and for --start-at-task to work'
     tags = ['readability']
 
+    _nameless_tasks = ['meta', 'debug', 'include_role', 'import_role',
+                       'include_tasks', 'import_tasks']
+
     def matchtask(self, file, task):
-        return task.get('name', '') == ''
+        return (not task.get('name') and
+                task["action"]["__ansible_module__"] not in self._nameless_tasks)

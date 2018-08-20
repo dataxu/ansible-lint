@@ -23,6 +23,8 @@ from collections import defaultdict
 import os
 import sys
 
+import six
+
 import ansiblelint.utils
 import codecs
 
@@ -64,16 +66,11 @@ class AnsibleLintRule(object):
         yaml = ansiblelint.utils.parse_yaml_linenumbers(text, file['path'])
         if yaml:
             for task in ansiblelint.utils.get_normalized_tasks(yaml, file):
-                # An empty `tags` block causes `None` to be returned if
-                # the `or []` is not present - `task.get('tags', [])`
-                # does not suffice.
-                if 'skip_ansible_lint' in (task.get('tags') or []):
-                    continue
                 if 'action' in task:
                     result = self.matchtask(file, task)
                     if result:
                         message = None
-                        if isinstance(result, basestring):
+                        if isinstance(result, six.string_types):
                             message = result
                         taskstr = "Task/Handler: " + ansiblelint.utils.task_to_str(task)
                         matches.append(Match(task[ansiblelint.utils.LINE_NUMBER_KEY], taskstr,
@@ -86,6 +83,8 @@ class AnsibleLintRule(object):
             return matches
         yaml = ansiblelint.utils.parse_yaml_linenumbers(text, file['path'])
         if yaml and hasattr(self, 'matchplay'):
+            if isinstance(yaml, dict):
+                yaml = [yaml]
             for play in yaml:
                 result = self.matchplay(file, play)
                 if result:
@@ -118,14 +117,14 @@ class RulesCollection(object):
     def extend(self, more):
         self.rules.extend(more)
 
-    def run(self, playbookfile, tags=set(), skip_list=set()):
+    def run(self, playbookfile, tags=set(), skip_list=frozenset()):
         text = ""
         matches = list()
 
         try:
             with codecs.open(playbookfile['path'], mode='rb', encoding='utf-8') as f:
                 text = f.read()
-        except IOError, e:
+        except IOError as e:
             print("WARNING: Couldn't open %s - %s" %
                   (playbookfile['path'], e.strerror),
                   file=sys.stderr)
@@ -181,7 +180,7 @@ class Match(object):
 class Runner(object):
 
     def __init__(self, rules, playbook, tags, skip_list, exclude_paths,
-                 verbosity=0):
+                 verbosity=0, checked_files=None):
         self.rules = rules
         self.playbooks = set()
         # assume role if directory
@@ -195,6 +194,9 @@ class Runner(object):
         self.skip_list = skip_list
         self._update_exclude_paths(exclude_paths)
         self.verbosity = verbosity
+        if checked_files is None:
+            checked_files = set()
+        self.checked_files = checked_files
 
     def _update_exclude_paths(self, exclude_paths):
         if exclude_paths:
@@ -232,10 +234,14 @@ class Runner(object):
                 visited.add(arg)
 
         matches = list()
+        # remove files that have already been checked
+        files = [x for x in files if x['path'] not in self.checked_files]
         for file in files:
             if self.verbosity > 0:
                 print("Examining %s of type %s" % (file['path'], file['type']))
             matches.extend(self.rules.run(file, tags=set(self.tags),
-                           skip_list=set(self.skip_list)))
+                           skip_list=self.skip_list))
+        # update list of checked files
+        self.checked_files.update([x['path'] for x in files])
 
         return matches
