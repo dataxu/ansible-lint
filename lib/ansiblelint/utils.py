@@ -22,12 +22,17 @@ import glob
 import imp
 import os
 
-import ansible.constants as C
+import six
+from ansible import constants
 from ansible.errors import AnsibleError
-from ansible.module_utils.splitter import split_args
 
-from itertools import chain
-import re
+try:
+    # Try to import the Ansible 2 module first, it's the future-proof one
+    from ansible.parsing.splitter import split_args
+
+except ImportError:
+    # Fallback on the Ansible 1.9 module
+    from ansible.module_utils.splitter import split_args
 
 import yaml
 from yaml.composer import Composer
@@ -44,12 +49,20 @@ except ImportError:
     from ansible.parsing.dataloader import DataLoader
     from ansible.template import Templar
     from ansible.parsing.mod_args import ModuleArgsParser
-    from ansible.plugins import module_loader
+    from ansible.parsing.yaml.constructor import AnsibleConstructor
+    from ansible.parsing.yaml.loader import AnsibleLoader
     from ansible.errors import AnsibleParserError
     ANSIBLE_VERSION = 2
 
+    # ansible-lint doesn't need/want to know about encrypted secrets, but it needs
+    # Ansible 2.3+ allows encrypted secrets within yaml files, so we pass a string
+    # as the password to enable such yaml files to be opened and parsed successfully.
+    DEFAULT_VAULT_PASSWORD = 'x'
+
     def parse_yaml_from_file(filepath):
         dl = DataLoader()
+        if hasattr(dl, 'set_vault_password'):
+            dl.set_vault_password(DEFAULT_VAULT_PASSWORD)
         return dl.load_from_file(filepath)
 
     def path_dwim(basedir, given):
@@ -63,17 +76,23 @@ except ImportError:
         templar = Templar(dl, variables=templatevars)
         return templar.template(varname, **kwargs)
 
+    try:
+        from ansible.plugins import module_loader
+    except ImportError:
+        from ansible.plugins.loader import module_loader
+
 LINE_NUMBER_KEY = '__line__'
 FILENAME_KEY = '__file__'
 
 VALID_KEYS = [
     'name', 'action', 'when', 'async', 'poll', 'notify',
-    'first_available_file', 'include', 'tags', 'register', 'ignore_errors',
-    'delegate_to', 'local_action', 'transport', 'remote_user', 'sudo', 'sudo_user',
-    'sudo_pass', 'when', 'connection', 'environment', 'args',
-    'any_errors_fatal', 'changed_when', 'failed_when', 'always_run', 'delay', 'retries', 'until',
-    'su', 'su_user', 'su_pass', 'no_log', 'run_once',
-    'become', 'become_user', 'become_method',
+    'first_available_file', 'include', 'import_playbook',
+    'tags', 'register', 'ignore_errors', 'delegate_to',
+    'local_action', 'transport', 'remote_user', 'sudo',
+    'sudo_user', 'sudo_pass', 'when', 'connection', 'environment', 'args', 'always_run',
+    'any_errors_fatal', 'changed_when', 'failed_when', 'check_mode', 'delay',
+    'retries', 'until', 'su', 'su_user', 'su_pass', 'no_log', 'run_once',
+    'become', 'become_user', 'become_method', FILENAME_KEY,
 ]
 
 BLOCK_NAME_TO_ACTION_TYPE_MAP = {
@@ -105,15 +124,7 @@ def load_plugins(directory):
     return result
 
 
-def contains_quote(str1, list1):
-    for item in list1:
-        if item in str1:
-            return item
-
-def tokenize(line, item=None):
-    line = line.lstrip()
-    if item:
-        line = re.sub(r'\{\{\s*item\s*\}\}', item, line)
+def tokenize(line):
     tokens = line.lstrip().split(" ")
     if tokens[0] == '-':
         tokens = tokens[1:]
@@ -124,28 +135,13 @@ def tokenize(line, item=None):
     args = list()
     kwargs = dict()
     nonkvfound = False
-
-    start_quotes = ['\'', '\"', '{{', '{%', '{#']
-    end_quotes   = ['\'', '\"', '}}', '%}', '#}']
-    quote = None
-    tmp = ''
     for arg in tokens[1:]:
-        if quote is not None:
-            tmp = tmp + ' ' + arg
-            if len(arg) > 0 and quote in arg:
-                 quote = None
-                 arg = tmp
-        elif len(arg) > 0 and contains_quote(arg, start_quotes) is not None:
-            tmp = arg
-            item = contains_quote(arg, start_quotes)
-            quote = end_quotes[start_quotes.index(item)]
-        if quote is None:
-            if "=" in arg and not nonkvfound:
-                kv = arg.split("=", 1)
-                kwargs[kv[0]] = kv[1]
-            else:
-                nonkvfound = True
-                args.append(arg)
+        if "=" in arg and not nonkvfound:
+            kv = arg.split("=", 1)
+            kwargs[kv[0]] = kv[1]
+        else:
+            nonkvfound = True
+            args.append(arg)
     return (command, args, kwargs)
 
 
@@ -166,7 +162,7 @@ def find_children(playbook, playbook_dir):
     else:
         try:
             playbook_ds = parse_yaml_from_file(playbook[0])
-        except AnsibleError, e:
+        except AnsibleError as e:
             raise SystemExit(str(e))
     results = []
     basedir = os.path.dirname(playbook[0])
@@ -205,7 +201,9 @@ def play_children(basedir, item, parent_type, playbook_dir):
         'tasks': _taskshandlers_children,
         'pre_tasks': _taskshandlers_children,
         'post_tasks': _taskshandlers_children,
+        'block': _taskshandlers_children,
         'include': _include_children,
+        'import_playbook': _include_children,
         'roles': _roles_children,
         'dependencies': _roles_children,
         'handlers': _taskshandlers_children,
@@ -235,22 +233,60 @@ def _include_children(basedir, k, v, parent_type):
 
 
 def _taskshandlers_children(basedir, k, v, parent_type):
-    return [{'path': path_dwim(basedir, th['include']),
-             'type': 'tasks'}
-            for th in v if 'include' in th]
+    results = []
+    for th in v:
+        if 'include' in th:
+            append_children(th['include'], basedir, k, parent_type, results)
+        elif 'include_tasks' in th:
+            append_children(th['include_tasks'], basedir, k, parent_type, results)
+        elif 'import_playbook' in th:
+            append_children(th['import_playbook'], basedir, k, parent_type, results)
+        elif 'import_tasks' in th:
+            append_children(th['import_tasks'], basedir, k, parent_type, results)
+        elif 'import_role' in th:
+            results.extend(_roles_children(basedir, k, [th['import_role'].get('name')], parent_type,
+                                           main=th['import_role'].get('tasks_from', 'main')))
+        elif 'include_role' in th:
+            results.extend(_roles_children(basedir, k, [th['include_role'].get('name')],
+                                           parent_type,
+                                           main=th['include_role'].get('tasks_from', 'main')))
+        elif 'block' in th:
+            results.extend(_taskshandlers_children(basedir, k, th['block'], parent_type))
+            if 'rescue' in th:
+                results.extend(_taskshandlers_children(basedir, k, th['rescue'], parent_type))
+            if 'always' in th:
+                results.extend(_taskshandlers_children(basedir, k, th['always'], parent_type))
+    return results
 
 
-def _roles_children(basedir, k, v, parent_type):
+def append_children(taskhandler, basedir, k, parent_type, results):
+    # when taskshandlers_children is called for playbooks, the
+    # actual type of the included tasks is the section containing the
+    # include, e.g. tasks, pre_tasks, or handlers.
+    if parent_type == 'playbook':
+        playbook_section = k
+    else:
+        playbook_section = parent_type
+    results.append({
+        'path': path_dwim(basedir, taskhandler),
+        'type': playbook_section
+    })
+
+
+def _roles_children(basedir, k, v, parent_type, main='main'):
     results = []
     for role in v:
         if isinstance(role, dict):
-            if 'role' in role:
+            if 'role' in role or 'name' in role:
                 if 'tags' not in role or 'skip_ansible_lint' not in role['tags']:
-                    results.extend(_look_for_role_files(basedir, role['role']))
+                    results.extend(_look_for_role_files(basedir,
+                                                        role.get('role', role.get('name')),
+                                                        main=main))
             else:
-                raise SystemExit('role dict {0} does not contain a "role" key'.format(role))
+                raise SystemExit('role dict {0} does not contain a "role" '
+                                 'or "name" key'.format(role))
         else:
-            results.extend(_look_for_role_files(basedir, role))
+            results.extend(_look_for_role_files(basedir, role, main=main))
     return results
 
 
@@ -273,9 +309,9 @@ def _rolepath(basedir, role):
         path_dwim(basedir, os.path.join('..', '..', role))
     ]
 
-    if C.DEFAULT_ROLES_PATH:
-        search_locations = C.DEFAULT_ROLES_PATH
-        if isinstance(search_locations, basestring):
+    if constants.DEFAULT_ROLES_PATH:
+        search_locations = constants.DEFAULT_ROLES_PATH
+        if isinstance(search_locations, six.string_types):
             search_locations = search_locations.split(os.pathsep)
         for loc in search_locations:
             loc = os.path.expanduser(loc)
@@ -292,7 +328,7 @@ def _rolepath(basedir, role):
     return role_path
 
 
-def _look_for_role_files(basedir, role):
+def _look_for_role_files(basedir, role, main='main'):
     role_path = _rolepath(basedir, role)
     if not role_path:
         return []
@@ -301,7 +337,7 @@ def _look_for_role_files(basedir, role):
 
     for th in ['tasks', 'handlers', 'meta']:
         for ext in ('.yml', '.yaml'):
-            thpath = os.path.join(role_path, th, 'main' + ext)
+            thpath = os.path.join(role_path, th, main + ext)
             if os.path.exists(thpath):
                 results.append({'path': thpath, 'type': th})
                 break
@@ -316,6 +352,7 @@ def rolename(filepath):
     role = role[:role.find('/')]
     return role
 
+
 def _kv_to_dict(v):
     (command, args, kwargs) = tokenize(v)
     return (dict(__ansible_module__=command, __ansible_arguments__=args, **kwargs))
@@ -323,6 +360,7 @@ def _kv_to_dict(v):
 
 def normalize_task_v2(task):
     '''Ensures tasks have an action key and strings are converted to python objects'''
+
     result = dict()
     mod_arg_parser = ModuleArgsParser(task)
     try:
@@ -358,7 +396,7 @@ def normalize_task_v2(task):
     result['action'] = dict(__ansible_module__=action)
 
     if '_raw_params' in arguments:
-        result['action']['__ansible_arguments__'] = arguments['_raw_params'].split()
+        result['action']['__ansible_arguments__'] = arguments['_raw_params'].split(' ')
         del(arguments['_raw_params'])
     else:
         result['action']['__ansible_arguments__'] = list()
@@ -378,7 +416,7 @@ def normalize_task_v1(task):
             else:
                 result[k] = v
         else:
-            if isinstance(v, basestring):
+            if isinstance(v, six.string_types):
                 v = _kv_to_dict(k + ' ' + v)
             elif not v:
                 v = dict(__ansible_module__=k)
@@ -432,17 +470,17 @@ def task_to_str(task):
     if name:
         return name
     action = task.get("action")
-    args = " " .join(["{0}={1}".format(k, v) for (k, v) in action.items()
+    args = " ".join([u"{0}={1}".format(k, v) for (k, v) in action.items()
                      if k not in ["__ansible_module__", "__ansible_arguments__"]] +
-                     action.get("__ansible_arguments__"))
-    return "{0} {1}".format(action["__ansible_module__"], args)
+                    action.get("__ansible_arguments__"))
+    return u"{0} {1}".format(action["__ansible_module__"], args)
 
 
 def extract_from_list(blocks, candidates):
     results = list()
     for block in blocks:
         for candidate in candidates:
-            if candidate in block:
+            if isinstance(block, dict) and candidate in block:
                 if isinstance(block[candidate], list):
                     results.extend(add_action_type(block[candidate], candidate))
                 elif block[candidate] is not None:
@@ -473,12 +511,24 @@ def get_action_tasks(yaml, file):
     block_rescue_always = ('block', 'rescue', 'always')
     tasks[:] = [task for task in tasks if all(k not in task for k in block_rescue_always)]
 
-    return [task for task in tasks if 'include' not in task.keys()]
+    return [task for task in tasks if
+            set(['include', 'include_tasks',
+                'import_playbook', 'import_tasks']).isdisjoint(task.keys())]
 
 
 def get_normalized_tasks(yaml, file):
     tasks = get_action_tasks(yaml, file)
-    return [normalize_task(task, file['path']) for task in tasks]
+    res = []
+    for task in tasks:
+        # An empty `tags` block causes `None` to be returned if
+        # the `or []` is not present - `task.get('tags', [])`
+        # does not suffice.
+        if 'skip_ansible_lint' in (task.get('tags') or []):
+            # No need to normalize_task is we are skipping it.
+            continue
+        res.append(normalize_task(task, file['path']))
+
+    return res
 
 
 def parse_yaml_linenumbers(data, filename):
@@ -495,12 +545,26 @@ def parse_yaml_linenumbers(data, filename):
         return node
 
     def construct_mapping(node, deep=False):
-        mapping = Constructor.construct_mapping(loader, node, deep=deep)
-        mapping[LINE_NUMBER_KEY] = node.__line__
+        if ANSIBLE_VERSION < 2:
+            mapping = Constructor.construct_mapping(loader, node, deep=deep)
+        else:
+            mapping = AnsibleConstructor.construct_mapping(loader, node, deep=deep)
+        if hasattr(node, '__line__'):
+            mapping[LINE_NUMBER_KEY] = node.__line__
+        else:
+            mapping[LINE_NUMBER_KEY] = mapping._line_number
+        mapping[FILENAME_KEY] = filename
         return mapping
 
     try:
-        loader = yaml.Loader(data)
+        if ANSIBLE_VERSION < 2:
+            loader = yaml.Loader(data)
+        else:
+            import inspect
+            kwargs = {}
+            if 'vault_password' in inspect.getargspec(AnsibleLoader.__init__).args:
+                kwargs['vault_password'] = DEFAULT_VAULT_PASSWORD
+            loader = AnsibleLoader(data, **kwargs)
         loader.compose_node = compose_node
         loader.construct_mapping = construct_mapping
         data = loader.get_single_data()

@@ -4,12 +4,15 @@ Ansible-lint
 ansible-lint checks playbooks for practices and behaviour that could
 potentially be improved
 
+[![PyPI version](https://img.shields.io/pypi/v/ansible-lint.svg)](https://pypi.org/project/ansible-lint/)
+[![Build Status](https://travis-ci.org/willthames/ansible-lint.svg?branch=master)](https://travis-ci.org/willthames/ansible-lint)
+
 Setup
 -----
 
 Using pip:
 ```
-pip install ansible-lint
+pip2 install ansible-lint
 ```
 
 From source:
@@ -48,6 +51,8 @@ Options:
                         repeatable.
   --force-color         Try force colored output (relying on ansible's code)
   --nocolor             disable colored output
+  -c /path/to/file      Specify configuration file to use.  Defaults to
+                          ".ansible-lint"
 ```
 
 False positives
@@ -68,7 +73,7 @@ I recommend commenting the reasons why you're skipping the check.
 Unfortunately ansible-lint is unable to check for such comments
 at this time! (patches welcome)
 
-```
+```yaml
 - name: this would typically fire CommandsInsteadOfArgumentRule
   command: warn=no chmod 644 X
 
@@ -164,6 +169,7 @@ In ansible-lint 3.0.0 `task['action']['module']` was renamed
 `task['action']['__ansible_module__']` to avoid a clash when a module take
 `module` as an argument. As a precaution, `task['action']['module_arguments']`
 was renamed `task['action']['__ansible_arguments__']`
+
 Examples
 --------
 
@@ -218,6 +224,50 @@ action: git a=b c=d
 As of version 2.4.0, ansible-lint now works just on roles (this is useful 
 for CI of roles)
 
+
+Configuration File
+==================
+
+Ansible-lint supports local configuration via a `.ansible-lint` configuration file.  Ansible-lint checks the working directory for the presence of this file and applies any configuration found there.  The configuration file location can also be overridden via the `-c path/to/file` CLI flag.
+
+The following values are supported and function identically to their CLI counterparts.
+
+If a value is provided on both the command line and via a config file, the values will be merged (if a list like `exclude_paths`), or the "True" value will be preferred, in the case of something like `quiet`.
+
+```yaml
+exclude_paths:
+  - ./my/excluded/directory/
+  - ./my/other/excluded/directory/
+  - ./last/excluded/directory/
+parseable: true
+quiet: true
+rulesdir:
+  - ./rule/directory/
+skip_list:
+  - skip_this_tag
+  - and_this_one_too
+tags:
+  - run_this_tag
+use_default_rules: true
+verbosity: 1
+```
+
+
+Pre-commit
+==========
+
+To use ansible-lint with [pre-commit](http://pre-commit.com/), just 
+add the following to your local repo's `.pre-commit-config.yaml` file. 
+Make sure to change `sha:` to be either a git commit sha or tag of 
+ansible-lint containing `hooks.yaml`.
+
+```yaml
+- repo: https://github.com/willthames/ansible-lint.git
+  sha: v3.3.1
+  hooks:
+    - id: ansible-lint
+      files: \.(yaml|yml)$
+```
 
 
 Contributing
